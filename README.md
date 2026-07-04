@@ -1,6 +1,6 @@
 # AWS DevOps Agent for AWS Databases
 
-Automatically detect, investigate, and diagnose in-database failures on Amazon Aurora PostgreSQL and Amazon Redshift using AWS DevOps Agent with custom MCP servers — where CloudWatch metrics stay green and only live SQL introspection reveals the root cause.
+Automatically detect, investigate, and diagnose in-database failures on Amazon Aurora PostgreSQL using AWS DevOps Agent with custom MCP servers — where CloudWatch metrics stay green and only live SQL introspection reveals the root cause.
 
 ## Overview
 
@@ -41,22 +41,47 @@ The MCP server bridges the gap between metric-based observability and in-databas
 
 ## Architecture
 
+```mermaid
+flowchart TB
+    subgraph "Investigation Flow"
+        A["👤 Engineer notices<br/>INSERT failures"] --> B["🤖 AWS DevOps Agent<br/>(Investigation)"]
+    end
+
+    subgraph "MCP Server Stack"
+        B -->|"JSON-RPC 2.0<br/>POST /mcp"| C["API Gateway<br/>HTTP API v2"]
+        C -->|"Validate API Key"| D["Authorizer Lambda"]
+        D -.->|"Read key"| E["Secrets Manager<br/>API Key"]
+        C -->|"Proxy"| F["MCP Lambda<br/>Python 3.13 / ARM64"]
+    end
+
+    subgraph "Database Layer"
+        F -->|"execute_query<br/>list_tables, etc."| G["RDS Data API"]
+        F -.->|"Get credentials"| H["Secrets Manager<br/>DB Credentials"]
+        G --> I[("Aurora PostgreSQL<br/>Serverless v2")]
+    end
+
+    subgraph "What the Agent Discovers"
+        I -.->|"pg_sequences<br/>pg_stat_user_tables<br/>pg_replication_slots<br/>pg_indexes"| J["📋 Root Cause +<br/>Mitigation Plan"]
+    end
+
+    style A fill:#ff6b6b,color:#fff
+    style B fill:#4ecdc4,color:#fff
+    style I fill:#45b7d1,color:#fff
+    style J fill:#96ceb4,color:#fff
 ```
-┌─────────────────┐       ┌──────────────────┐       ┌─────────────────────┐
-│  DevOps Agent   │──────▶│  API Gateway     │──────▶│  MCP Lambda         │
-│  (Investigator) │       │  (HTTP API v2)   │       │  (Python 3.13)      │
-└─────────────────┘       └──────────────────┘       └─────────┬───────────┘
-                                   │                            │
-                          ┌────────┴────────┐          ┌───────▼───────────┐
-                          │  Authorizer     │          │  RDS Data API     │
-                          │  Lambda         │          └───────┬───────────┘
-                          └────────┬────────┘                  │
-                                   │                  ┌────────▼───────────┐
-                          ┌────────▼────────┐         │  Aurora PostgreSQL │
-                          │  Secrets Manager│         │  Serverless v2     │
-                          │  (API Key +     │         └────────────────────┘
-                          │   DB Creds)     │
-                          └─────────────────┘
+
+### Flow Summary
+
+```mermaid
+flowchart LR
+    A["❌ Inserts Fail"] --> B["📊 CloudWatch:<br/>ALL GREEN"]
+    B --> C["🤖 DevOps Agent<br/>Investigates"]
+    C --> D["🔧 MCP Server<br/>execute_query"]
+    D --> E["🎯 Root Cause:<br/>pg_sequences at 100%"]
+
+    style A fill:#ff6b6b,color:#fff
+    style B fill:#2ecc71,color:#fff
+    style E fill:#96ceb4,color:#fff
 ```
 
 **Flow:**
