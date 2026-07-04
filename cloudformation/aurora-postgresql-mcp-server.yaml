@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Hosts the Aurora PostgreSQL MCP server as a Streamable HTTP endpoint
+  via Lambda + API Gateway HTTP API v2, suitable for registration as
+  an AWS DevOps Agent Capability Provider.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: demo
+    Description: Naming prefix for all resources
+
+  DBUsername:
+    Type: String
+    Default: postgres
+    Description: Aurora PostgreSQL master username
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: 'Welcome1!'
+    Description: Aurora PostgreSQL master password
+
+  AllowWriteQueries:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Allow write queries (INSERT, UPDATE, DELETE, etc.)
+
+Resources:
+
+  DBCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/${Environment}/postgres-mcp-server/db-credentials'
+      Description: Aurora PostgreSQL credentials for RDS Data API
+      SecretString: !Sub '{"username":"${DBUsername}","password":"${DBPassword}"}'
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  McpApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/${Environment}/postgres-mcp-server/api-key'
+      Description: API key for DevOps Agent to authenticate with the PostgreSQL MCP server
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: api_key
+        PasswordLength: 32
+        ExcludeCharacters: "\"@/\\<>&'%?:;|{}[]()=+#^~` "
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  McpLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-postgres-mcp-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: PostgresMcpPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: RDSDataAPI
+                Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - rds-data:BatchExecuteStatement
+                  - rds-data:BeginTransaction
+                  - rds-data:CommitTransaction
+                  - rds-data:RollbackTransaction
+                Resource: '*'
+              - Sid: RDSDescribe
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusterEndpoints
+                Resource: '*'
+              - Sid: SecretsManager
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*'
+              - Sid: IAMDatabaseAuth
+                Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: !Sub 'arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:dbuser:*/*'
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  AuthorizerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-postgres-mcp-authorizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadApiKeySecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref McpApiKeySecret
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  McpLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-postgres-mcp-server'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt McpLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          ALLOW_WRITE_QUERIES: !Ref AllowWriteQueries
+          DB_SECRET_ARN: !Ref DBCredentialsSecret
+      Code:
+        ZipFile: |
+          import json, os, time, boto3
+
+          rds = boto3.client('rds')
+          rds_data = boto3.client('rds-data')
+
+          ALLOW_WRITE = os.environ.get('ALLOW_WRITE_QUERIES', 'false').lower() == 'true'
+          DB_SECRET_ARN = os.environ.get('DB_SECRET_ARN', '')
+
+          TOOLS = [
+              {'name': 'list_clusters', 'description': 'List all Aurora PostgreSQL and RDS PostgreSQL clusters.', 'inputSchema': {'type': 'object', 'properties': {}}},
+              {'name': 'list_databases', 'description': 'List all databases in a cluster.', 'inputSchema': {'type': 'object', 'properties': {'cluster_identifier': {'type': 'string', 'description': 'Aurora cluster identifier'}, 'database': {'type': 'string', 'description': 'Database to connect to'}}, 'required': ['cluster_identifier', 'database']}},
+              {'name': 'list_schemas', 'description': 'List all schemas in a database.', 'inputSchema': {'type': 'object', 'properties': {'cluster_identifier': {'type': 'string'}, 'database': {'type': 'string'}}, 'required': ['cluster_identifier', 'database']}},
+              {'name': 'list_tables', 'description': 'List all tables in a schema.', 'inputSchema': {'type': 'object', 'properties': {'cluster_identifier': {'type': 'string'}, 'database': {'type': 'string'}, 'schema_name': {'type': 'string', 'description': 'Schema name (default: public)'}}, 'required': ['cluster_identifier', 'database']}},
+              {'name': 'describe_table', 'description': 'Describe table structure (columns, types, constraints).', 'inputSchema': {'type': 'object', 'properties': {'cluster_identifier': {'type': 'string'}, 'database': {'type': 'string'}, 'schema_name': {'type': 'string', 'description': 'Schema name (default: public)'}, 'table_name': {'type': 'string', 'description': 'Table name'}}, 'required': ['cluster_identifier', 'database', 'table_name']}},
+              {'name': 'execute_query', 'description': 'Execute a SQL query against Aurora PostgreSQL via the Data API.', 'inputSchema': {'type': 'object', 'properties': {'cluster_identifier': {'type': 'string'}, 'database': {'type': 'string'}, 'sql': {'type': 'string', 'description': 'SQL query to execute'}}, 'required': ['cluster_identifier', 'database', 'sql']}}
+          ]
+
+          def lambda_handler(event, context):
+              http_method = event.get('requestContext', {}).get('http', {}).get('method', 'POST')
+              if http_method == 'GET':
+                  return {'statusCode': 200, 'headers': {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'}, 'body': ''}
+              body = event.get('body', '{}') or '{}'
+              if event.get('isBase64Encoded'):
+                  import base64
+                  body = base64.b64decode(body).decode('utf-8')
+              response = handle_jsonrpc(json.loads(body))
+              return {'statusCode': 200, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps(response)}
+
+          def handle_jsonrpc(req):
+              method = req.get('method', '')
+              req_id = req.get('id')
+              params = req.get('params', {})
+              if method == 'ping':
+                  return {'jsonrpc': '2.0', 'id': req_id, 'result': {}}
+              if method == 'initialize':
+                  return {'jsonrpc': '2.0', 'id': req_id, 'result': {'protocolVersion': '2024-11-05', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'postgres-mcp', 'version': '2.0.0'}}}
+              if method == 'tools/list':
+                  return {'jsonrpc': '2.0', 'id': req_id, 'result': {'tools': TOOLS}}
+              if method == 'tools/call':
+                  tool_name = params.get('name', '')
+                  args = params.get('arguments', {})
+                  result = dispatch(tool_name, args)
+                  return {'jsonrpc': '2.0', 'id': req_id, 'result': result}
+              return {'jsonrpc': '2.0', 'id': req_id, 'error': {'code': -32601, 'message': 'Method not found'}}
+
+          def dispatch(tool_name, args):
+              try:
+                  if tool_name == 'list_clusters':
+                      return do_list_clusters()
+                  if tool_name == 'list_databases':
+                      return do_run_query(args, "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname")
+                  if tool_name == 'list_schemas':
+                      return do_run_query(args, "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY schema_name")
+                  if tool_name == 'list_tables':
+                      schema = args.get('schema_name', 'public')
+                      return do_run_query(args, f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}' AND table_type = 'BASE TABLE' ORDER BY table_name")
+                  if tool_name == 'describe_table':
+                      schema = args.get('schema_name', 'public')
+                      table = args.get('table_name', '')
+                      return do_run_query(args, f"SELECT column_name, data_type, character_maximum_length, is_nullable, column_default FROM information_schema.columns WHERE table_schema = '{schema}' AND table_name = '{table}' ORDER BY ordinal_position")
+                  if tool_name == 'execute_query':
+                      sql = args.get('sql', 'SELECT 1')
+                      if not ALLOW_WRITE:
+                          write_keywords = ['INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 'ALTER', 'TRUNCATE']
+                          if any(kw in sql.upper() for kw in write_keywords):
+                              return error_response('Write queries are disabled. Set ALLOW_WRITE_QUERIES=true to enable.')
+                      return do_run_query(args, sql)
+                  return error_response(f'Unknown tool: {tool_name}')
+              except Exception as e:
+                  return error_response(str(e))
+
+          def do_list_clusters():
+              results = []
+              paginator = rds.get_paginator('describe_db_clusters')
+              for page in paginator.paginate():
+                  for c in page.get('DBClusters', []):
+                      if 'postgresql' in c.get('Engine', ''):
+                          endpoint = c.get('Endpoint', 'N/A')
+                          status = c.get('Status', 'unknown')
+                          data_api = 'Yes' if c.get('HttpEndpointEnabled') else 'No'
+                          results.append(f"{c['DBClusterIdentifier']} ({status}) | Endpoint: {endpoint} | Data API: {data_api}")
+              text = '\n'.join(results) or 'No PostgreSQL clusters found'
+              return success_response(text)
+
+          def do_run_query(args, sql):
+              cluster_id = args.get('cluster_identifier', '')
+              database = args.get('database', '')
+              resp = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+              cluster_arn = resp['DBClusters'][0]['DBClusterArn']
+              result = rds_data.execute_statement(resourceArn=cluster_arn, secretArn=DB_SECRET_ARN, database=database, sql=sql)
+              if 'records' not in result or not result['records']:
+                  return success_response('Query executed successfully (no results returned)')
+              records = result['records']
+              column_metadata = result.get('columnMetadata', [])
+              if not column_metadata:
+                  return success_response(json.dumps(records, indent=2))
+              headers = [col['label'] for col in column_metadata]
+              rows = []
+              for record in records:
+                  row = []
+                  for field in record:
+                      value = list(field.values())[0] if field else ''
+                      row.append(str(value))
+                  rows.append(row)
+              lines = [' | '.join(headers)]
+              lines.append('-' * len(lines[0]))
+              lines += [' | '.join(row) for row in rows]
+              return success_response('\n'.join(lines))
+
+          def success_response(text):
+              return {'content': [{'type': 'text', 'text': text}]}
+
+          def error_response(error_msg):
+              return {'content': [{'type': 'text', 'text': f'ERROR: {error_msg}'}], 'isError': True}
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-postgres-mcp-authorizer'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref McpApiKeySecret
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          sm = boto3.client('secretsmanager')
+          SECRET_ARN = os.environ['SECRET_ARN']
+          _cached = None
+          def get_api_key():
+              global _cached
+              if _cached: return _cached
+              resp = sm.get_secret_value(SecretId=SECRET_ARN)
+              _cached = json.loads(resp['SecretString'])['api_key']
+              return _cached
+          def lambda_handler(event, context):
+              headers = event.get('headers') or {}
+              token = headers.get('authorization', '')
+              valid = token == get_api_key()
+              return {'isAuthorized': valid, 'context': {'authorized': str(valid)}}
+      Tags:
+        - Key: Project
+          Value: postgres-mcp-server
+
+  McpHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${Environment}-postgres-mcp-api'
+      ProtocolType: HTTP
+      Description: Streamable HTTP endpoint for PostgreSQL MCP server
+
+  McpLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref McpHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt McpLambdaFunction.Arn
+      PayloadFormatVersion: '2.0'
+      TimeoutInMillis: 29000
+
+  McpAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref McpHttpApi
+      AuthorizerType: REQUEST
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
+      AuthorizerPayloadFormatVersion: '2.0'
+      EnableSimpleResponses: true
+      Name: ApiKeyAuthorizer
+      IdentitySource:
+        - '$request.header.Authorization'
+
+  McpApiPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpHttpApi
+      RouteKey: 'POST /mcp'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref McpAuthorizer
+      Target: !Sub 'integrations/${McpLambdaIntegration}'
+
+  McpApiGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref McpHttpApi
+      RouteKey: 'GET /mcp'
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref McpAuthorizer
+      Target: !Sub 'integrations/${McpLambdaIntegration}'
+
+  McpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref McpHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  McpLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref McpLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${McpHttpApi}/*/*'
+
+  AuthorizerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${McpHttpApi}/*'
+
+Outputs:
+  McpEndpointUrl:
+    Description: "Paste this URL into DevOps Agent Capability Providers (auth header: Authorization)"
+    Value: !Sub 'https://${McpHttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp'
+    Export:
+      Name: !Sub '${AWS::StackName}-McpEndpointUrl'
+
+  ApiKeySecretArn:
+    Description: "Retrieve the API key value from this secret (field api_key)"
+    Value: !Ref McpApiKeySecret
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiKeySecretArn'
+
+  DBCredentialsSecretArn:
+    Description: "Secret holding the Aurora DB credentials used by the MCP server"
+    Value: !Ref DBCredentialsSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-DBCredentialsSecretArn'
+
+  LambdaFunctionName:
+    Value: !Ref McpLambdaFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaName'
+
+  WriteQueriesEnabled:
+    Description: Whether write queries (INSERT, UPDATE, DELETE) are allowed
+    Value: !Ref AllowWriteQueries
