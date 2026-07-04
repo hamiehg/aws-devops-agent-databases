@@ -1,4 +1,4 @@
-# AWS DevOps Agent for AWS Databases
+# Database Incident Investigation with AWS DevOps Agent
 
 Automatically detect, investigate, and diagnose in-database failures on Amazon Aurora PostgreSQL using AWS DevOps Agent with custom MCP servers — where CloudWatch metrics stay green and only live SQL introspection reveals the root cause.
 
