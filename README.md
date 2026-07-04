@@ -42,46 +42,76 @@ The MCP server bridges the gap between metric-based observability and in-databas
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph "Investigation Flow"
-        A["👤 Engineer notices<br/>INSERT failures"] --> B["🤖 AWS DevOps Agent<br/>(Investigation)"]
+flowchart LR
+    subgraph trigger [" 🔥 Incident "]
+        A(["👤 Engineer<br/>notices failures"])
     end
 
-    subgraph "MCP Server Stack"
-        B -->|"JSON-RPC 2.0<br/>POST /mcp"| C["API Gateway<br/>HTTP API v2"]
-        C -->|"Validate API Key"| D["Authorizer Lambda"]
-        D -.->|"Read key"| E["Secrets Manager<br/>API Key"]
-        C -->|"Proxy"| F["MCP Lambda<br/>Python 3.13 / ARM64"]
+    subgraph agent [" 🤖 AWS DevOps Agent "]
+        B["Investigation<br/>Engine"]
     end
 
-    subgraph "Database Layer"
-        F -->|"execute_query<br/>list_tables, etc."| G["RDS Data API"]
-        F -.->|"Get credentials"| H["Secrets Manager<br/>DB Credentials"]
-        G --> I[("Aurora PostgreSQL<br/>Serverless v2")]
+    subgraph mcp [" ⚡ MCP Server "]
+        direction TB
+        C["API Gateway<br/>HTTP API v2"]
+        D["Authorizer<br/>Lambda"]
+        E["MCP Lambda<br/>Python 3.13"]
+        C --> D
+        C --> E
     end
 
-    subgraph "What the Agent Discovers"
-        I -.->|"pg_sequences<br/>pg_stat_user_tables<br/>pg_replication_slots<br/>pg_indexes"| J["📋 Root Cause +<br/>Mitigation Plan"]
+    subgraph secrets [" 🔐 Secrets Manager "]
+        F["API Key"]
+        G["DB Credentials"]
     end
 
-    style A fill:#ff6b6b,color:#fff
-    style B fill:#4ecdc4,color:#fff
-    style I fill:#45b7d1,color:#fff
-    style J fill:#96ceb4,color:#fff
+    subgraph db [" 🗄️ Database "]
+        H["RDS Data API"]
+        I[("Aurora PostgreSQL<br/>Serverless v2")]
+        H --> I
+    end
+
+    subgraph catalogs [" 🔍 System Catalogs "]
+        J["pg_sequences<br/>pg_stat_user_tables<br/>pg_replication_slots<br/>pg_indexes<br/>information_schema"]
+    end
+
+    A --> B
+    B -->|"JSON-RPC 2.0"| C
+    D -.-> F
+    E -.-> G
+    E -->|"SQL"| H
+    I --> J
+    J -->|"Root Cause +<br/>Mitigation Plan"| B
+
+    style trigger fill:#fff5f5,stroke:#ff6b6b
+    style agent fill:#f0fffe,stroke:#4ecdc4
+    style mcp fill:#f8f9fa,stroke:#6c757d
+    style db fill:#f0f8ff,stroke:#45b7d1
+    style catalogs fill:#f0fff4,stroke:#96ceb4
+    style secrets fill:#fff8f0,stroke:#ffa94d
 ```
 
-### Flow Summary
+### Investigation Flow (Simplified)
 
 ```mermaid
 flowchart LR
-    A["❌ Inserts Fail"] --> B["📊 CloudWatch:<br/>ALL GREEN"]
-    B --> C["🤖 DevOps Agent<br/>Investigates"]
-    C --> D["🔧 MCP Server<br/>execute_query"]
-    D --> E["🎯 Root Cause:<br/>pg_sequences at 100%"]
+    A["❌ App Fails<br/>(Inserts rejected)"]
+    B["📊 CloudWatch<br/>ALL GREEN ✓"]
+    C["🤖 DevOps Agent"]
+    D["🔧 MCP Server<br/>execute_query"]
+    E["🗄️ pg_sequences<br/>pg_stat_user_tables"]
+    F["✅ Root Cause<br/>+ Fix Plan"]
+
+    A --> B
+    B -->|"No alerts fire"| C
+    C -->|"JSON-RPC"| D
+    D -->|"SQL"| E
+    E --> F
 
     style A fill:#ff6b6b,color:#fff
     style B fill:#2ecc71,color:#fff
-    style E fill:#96ceb4,color:#fff
+    style C fill:#4ecdc4,color:#fff
+    style F fill:#96ceb4,color:#fff
 ```
 
 **Flow:**
@@ -142,7 +172,127 @@ aws cloudformation wait stack-create-complete --stack-name aurora-mcp-server
 
 ### 4. Register with DevOps Agent
 
-See [docs/DEVOPS_AGENT_INTEGRATION.md](docs/DEVOPS_AGENT_INTEGRATION.md) for console and CLI instructions.
+#### Prerequisites
+
+Before starting, ensure you have:
+
+- **Aurora PostgreSQL MCP server deployed** — the CloudFormation stack (`aurora-postgresql-mcp-server.yaml`) is successfully created
+- **MCP Endpoint URL** — available in the stack outputs (e.g., `https://pv1b2tti50.execute-api.us-east-1.amazonaws.com/mcp`)
+- **API Key** — stored in Secrets Manager at `/<environment>/postgres-mcp-server/api-key`
+- **AWS DevOps Agent** — access to the DevOps Agent console in a supported region (us-east-1, us-west-2, ap-southeast-2, ap-northeast-1, eu-central-1, or eu-west-1)
+
+#### Step 1: Retrieve the MCP Endpoint URL
+
+**From CloudFormation Console:**
+
+1. AWS Console → **CloudFormation**
+2. Select your MCP server stack
+3. Go to the **Outputs** tab
+4. Copy the value of **McpEndpointUrl**
+
+#### Step 2: Retrieve the API Key
+
+**From Secrets Manager Console:**
+
+1. AWS Console → **Secrets Manager**
+2. Find the secret: `/<environment>/postgres-mcp-server/api-key`
+3. Click on the secret name
+4. Scroll to the **Secret value** section
+5. Click **Retrieve secret value**
+6. Copy the value of the `api_key` field
+
+#### Step 3: Register the MCP Server (Account Level)
+
+MCP servers are registered at the AWS account level and shared among all Agent Spaces.
+
+**Via Console (Recommended):**
+
+1. Sign in to the **AWS Management Console**
+2. Navigate to the **AWS DevOps Agent** console
+3. Go to **Capability Providers** (side navigation)
+4. Find **MCP Server** in the Available providers section
+5. Click **Register**
+6. Leave **Enable Dynamic Client Registration** unchecked
+7. Leave **Connect to endpoint using private connection** unchecked (unless your MCP server is on a private network)
+8. Click **Next**
+
+**Page 2: Authorization Flow**
+
+Select **API Key**. Click **Next**.
+
+**Page 3: Authorization Configuration**
+
+| Field | Value |
+|-------|-------|
+| API Key Name | `Aurora-Postgres-MCP-Key` |
+| API Key Header | `Authorization` |
+| API Key Value | *(paste the value retrieved in Step 2)* |
+
+Click **Next**.
+
+**Page 4: Review and Submit**
+
+1. Review all configuration details
+2. Click **Submit**
+3. AWS DevOps Agent will validate the connection to your MCP server
+4. Wait for the status to show as registered/valid
+
+Save the returned `serviceId` for the next steps.
+
+#### Step 4: Create an Agent Space (if needed)
+
+Skip this step if you want to add the MCP server to an existing Agent Space.
+
+**Via Console:**
+
+1. In the DevOps Agent console, click **Create Agent Space**
+2. Enter a name (e.g., `Aurora-PostgreSQL-Space`)
+3. Click **Create**
+
+Save the returned `agentSpaceId`.
+
+#### Step 5: Associate AWS Account with the Agent Space
+
+This gives the Agent Space access to your AWS resources for investigation.
+
+**Via Console:**
+
+1. Select your Agent Space
+2. Go to the **Capabilities** tab
+3. Under **AWS Account**, click **Associate**
+4. Select or create an IAM role with the necessary permissions
+5. Enter your Account ID
+6. Select account type: **monitor**
+
+#### Step 6: Associate Event Channel (Optional)
+
+Enables event-driven investigations (e.g., triggered by CloudWatch alarms).
+
+#### Step 7: Add the MCP Server to the Agent Space
+
+**Via Console:**
+
+1. Select your Agent Space
+2. Go to the **Capabilities** tab
+3. In the **MCP Servers** section, click **Add**
+4. Select `aurora-postgres-mcp-server`
+5. Configure tool access — **Select specific tools** (recommended) and allowlist:
+   - `list_clusters`
+   - `list_databases`
+   - `list_schemas`
+   - `list_tables`
+   - `describe_table`
+   - `execute_query`
+6. Or choose **Allow all tools**
+7. Click **Add**
+
+#### Step 8: Verify the Integration
+
+**From the Console:**
+
+1. Go to your Agent Space
+2. Open the **Capabilities** tab
+3. Confirm the MCP Server appears with status **Valid**
 
 ### 5. Setup the test schema
 
