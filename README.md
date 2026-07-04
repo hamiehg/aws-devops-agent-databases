@@ -177,7 +177,7 @@ aws cloudformation wait stack-create-complete --stack-name aurora-mcp-server
 Before starting, ensure you have:
 
 - **Aurora PostgreSQL MCP server deployed** — the CloudFormation stack (`aurora-postgresql-mcp-server.yaml`) is successfully created
-- **MCP Endpoint URL** — available in the stack outputs (e.g., `https://pv1b2tti50.execute-api.us-east-1.amazonaws.com/mcp`)
+- **MCP Endpoint URL** — available in the stack outputs 
 - **API Key** — stored in Secrets Manager at `/<environment>/postgres-mcp-server/api-key`
 - **AWS DevOps Agent** — access to the DevOps Agent console in a supported region (us-east-1, us-west-2, ap-southeast-2, ap-northeast-1, eu-central-1, or eu-west-1)
 
